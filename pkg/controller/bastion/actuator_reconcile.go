@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/gardener/gardener/extensions/pkg/controller"
@@ -21,13 +20,12 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/floatingips"
-	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/security/groups"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/security/rules"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/subnets"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/utils/net"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	openstackapi "github.com/gardener/gardener-extension-provider-openstack/pkg/apis/openstack"
@@ -231,24 +229,39 @@ func ensurePublicIPAddress(ctx context.Context, opts Options, client openstackcl
 		}
 	}
 
-	// locate the first ipv4 address.
-	idx := slices.IndexFunc(router.GatewayInfo.ExternalFixedIPs, func(s routers.ExternalFixedIP) bool {
-		return net.IsIPv4String(s.IPAddress)
+
+	subnetList, err := client.ListSubnets(ctx, subnets.ListOpts{
+		NetworkID: infraStatus.Networks.FloatingPool.ID,
+		IPVersion: 4,
 	})
-	if idx == -1 {
-		return floatingips.FloatingIP{}, fmt.Errorf("failed to locate a suitable ipv4 address in the router external fixed IPs")
-	}
-
-	createOpts := floatingips.CreateOpts{
-		Description:       opts.BastionInstanceName,
-		FloatingNetworkID: infraStatus.Networks.FloatingPool.ID,
-		SubnetID:          router.GatewayInfo.ExternalFixedIPs[idx].SubnetID,
-	}
-
-	opts.Logr.Info("Creating public IP address", "name", opts.BastionInstanceName, "subnetID", createOpts.SubnetID, "floatingNetworkID", createOpts.FloatingNetworkID)
-	fip, err := createFloatingIP(ctx, client, createOpts)
 	if err != nil {
-		return floatingips.FloatingIP{}, fmt.Errorf("failed to create public ip address: %w", err)
+		return floatingips.FloatingIP{}, fmt.Errorf("failed to list subnets of floating network %s: %w", infraStatus.Networks.FloatingPool.ID, err)
+	}
+	if len(subnetList) == 0 {
+		return floatingips.FloatingIP{}, fmt.Errorf("no ipv4 subnets found in floating network %s", infraStatus.Networks.FloatingPool.ID)
+	}
+
+	var fip floatingips.FloatingIP
+	var lastErr error
+	for _, subnet := range subnetList {
+		createOpts := floatingips.CreateOpts{
+			Description:       opts.BastionInstanceName,
+			FloatingNetworkID: infraStatus.Networks.FloatingPool.ID,
+			SubnetID:          subnet.ID,
+		}
+		opts.Logr.Info("Creating public IP address", "name", opts.BastionInstanceName, "subnetID", subnet.ID, "floatingNetworkID", createOpts.FloatingNetworkID)
+		fip, lastErr = createFloatingIP(ctx, client, createOpts)
+		if lastErr == nil {
+			break
+		}
+		if gophercloud.ResponseCodeIs(lastErr, http.StatusConflict) {
+			opts.Logr.Info("Subnet exhausted, trying next", "subnetID", subnet.ID, "err", lastErr)
+			continue
+		}
+		return floatingips.FloatingIP{}, fmt.Errorf("failed to create public ip address: %w", lastErr)
+	}
+	if lastErr != nil {
+		return floatingips.FloatingIP{}, fmt.Errorf("all ipv4 subnets exhausted, failed to create public ip address: %w", lastErr)
 	}
 	opts.Logr.Info("Public IP address created", "name", opts.BastionInstanceName, "ip", fip.FloatingIP)
 
